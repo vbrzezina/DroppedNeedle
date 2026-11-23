@@ -27,6 +27,7 @@ from services.native.library_indexer import INDEX_BATCH_SIZE, LibraryIndexer
 from services.native.library_filesystem_coordinator import (
     LibraryFilesystemCoordinator,
 )
+from services.native.library_filesystem_watcher import _scoped_scopes, _snapshot_tree
 from services.native.library_inventory_scanner import (
     DirectoryWalker,
     INVENTORY_BATCH_SIZE,
@@ -1774,6 +1775,44 @@ async def test_reconciliation_is_bounded_and_resumes_past_its_cursor(
 
 
 @pytest.mark.asyncio
+async def test_watcher_scoped_incremental_run_only_reconciles_its_folder(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """#620: a watcher-style folder scope marks only that folder's files missing."""
+    root = tmp_path / "music"
+    for folder, name in (("Artist/One", "track-1.flac"), ("Artist/Two", "track-2.flac")):
+        (root / folder).mkdir(parents=True)
+        (root / folder / name).write_bytes(b"audio")
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    first = await coordinator.run_once({"root-a": root})
+    assert first is not None and first.state == "completed"
+
+    (root / "Artist/One/track-1.flac").unlink()
+    (root / "Artist/Two/track-2.flac").unlink()
+    scopes = _scoped_scopes("root-a", {"Artist/One"}, resolver, _snapshot_tree(root))
+    assert scopes is not None and [scope.relative_path for scope in scopes] == [
+        "Artist/One"
+    ]
+    await coordinator.request_run(
+        ScanRequest(
+            kind="incremental",
+            trigger="automatic",
+            policy_revision=resolver.policy_revision,
+            scopes=scopes,
+        )
+    )
+    scoped = await coordinator.run_once({"root-a": root})
+    assert scoped is not None and scoped.state == "completed"
+
+    one = await target_store.get_stored_sibling_context("root-a", "Artist/One")
+    two = await target_store.get_stored_sibling_context("root-a", "Artist/Two")
+    assert [row["availability"] for row in one] == ["missing"]
+    assert [row["availability"] for row in two] == ["indexed"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["discovering", "indexing", "reconciling", "paused"])
 async def test_policy_supersession_is_terminal_and_queues_nothing(
     target_store: NativeLibraryStore, tmp_path: Path, phase: str
@@ -2004,6 +2043,63 @@ async def test_scheduler_anchor_is_not_hidden_by_many_policy_reconciliations(
 
     assert anchor is not None
     assert anchor.id == "filesystem"
+
+
+async def _terminal_run_with_scopes(
+    store: NativeLibraryStore,
+    db_path: Path,
+    run_id: str,
+    queued_at: float,
+    scope_ids: list[str],
+) -> None:
+    await store.create_scan_run(
+        ScanRun(id=run_id, kind="incremental", trigger="automatic", queued_at=queued_at)
+    )
+    with sqlite3.connect(db_path) as connection:
+        NativeLibraryStore._insert_scan_scopes(
+            connection,
+            run_id,
+            [
+                ScanScope(
+                    root_id="root-a",
+                    scope_id=scope_id,
+                    relative_path="." if not scope_id.startswith("watch:") else "A",
+                    root_path="/music",
+                    policy_revision="rev",
+                )
+                for scope_id in scope_ids
+            ],
+        )
+        connection.execute(
+            "UPDATE library_scan_runs SET state = 'completed', phase = 'reconciling', "
+            "terminal_at = queued_at, updated_at = queued_at WHERE id = ?",
+            (run_id,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_anchor_ignores_watcher_runs_scoped_to_folders(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """#620: folder-scoped watcher runs must not reset the rolling schedule."""
+    db_path = tmp_path / "target.db"
+    await _terminal_run_with_scopes(target_store, db_path, "full", 1, ["root-a"])
+    await _terminal_run_with_scopes(
+        target_store, db_path, "watch-only", 10, ["watch:root-a:A", "watch:root-a:B"]
+    )
+    anchor = await target_store.get_latest_filesystem_scan_terminal()
+    assert anchor is not None and anchor.id == "full"
+
+    # A watcher run that fell back to whole roots walked everything: it counts,
+    # and so does a run that mixes watcher and non-watcher scopes.
+    await _terminal_run_with_scopes(target_store, db_path, "watch-whole", 20, ["root-a"])
+    anchor = await target_store.get_latest_filesystem_scan_terminal()
+    assert anchor is not None and anchor.id == "watch-whole"
+    await _terminal_run_with_scopes(
+        target_store, db_path, "mixed", 30, ["watch:root-a:A", "root-a"]
+    )
+    anchor = await target_store.get_latest_filesystem_scan_terminal()
+    assert anchor is not None and anchor.id == "mixed"
 
 
 @pytest.mark.parametrize(

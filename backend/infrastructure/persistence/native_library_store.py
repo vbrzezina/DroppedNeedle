@@ -11118,6 +11118,14 @@ class NativeLibraryStore(PersistenceBase):
             row = connection.execute(
                 "SELECT * FROM library_scan_runs WHERE terminal_at IS NOT NULL "
                 "AND (kind != 'policy_reconcile' OR aggregate_scope = 'all') "
+                # Filesystem-watcher runs scoped to changed folders never walk
+                # the whole library, so they must not reset the rolling
+                # schedule; a watcher run that fell back to whole roots does.
+                "AND NOT (EXISTS (SELECT 1 FROM library_scan_run_scopes s "
+                "WHERE s.run_id = library_scan_runs.id) "
+                "AND NOT EXISTS (SELECT 1 FROM library_scan_run_scopes s "
+                "WHERE s.run_id = library_scan_runs.id "
+                "AND (s.scope_id IS NULL OR substr(s.scope_id, 1, 6) != 'watch:'))) "
                 "ORDER BY terminal_at DESC, id DESC LIMIT 1"
             ).fetchone()
             return self._scan_state_from_row(row) if row is not None else None

@@ -4,13 +4,16 @@ import asyncio
 import errno
 import logging
 import os
+import shutil
 import sqlite3
 import threading
 import time
+import unicodedata
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -46,8 +49,13 @@ from api.v1.schemas.library_policies import (
     TypedLibrarySettings,
 )
 from services.native.library_filesystem_watcher import (
+    MAX_SCOPED_FOLDERS,
     WATCHER_TASK_NAME,
     WatcherSettings,
+    _changed_folders,
+    _collapse_nested,
+    _scannable_folder,
+    _scoped_scopes,
     _snapshot_tree,
     start_library_filesystem_watcher,
     watch_library_filesystem,
@@ -3483,9 +3491,14 @@ async def test_filesystem_watcher_detects_nested_mutation(
 ) -> None:
     """T15 (S-01 Hook C): a nested-only snapshot move requests one scan."""
     resolver, coordinator, scheduler, wakeups, root = _watcher_harness(tmp_path)
-    nested_before = {"a/b/old.flac": (100, 10, False)}
-    nested_after = {
+    nested_before = {
+        "a": (100, 0, True),
+        "a/b": (100, 0, True),
         "a/b/old.flac": (100, 10, False),
+    }
+    nested_after = {
+        **nested_before,
+        "a/b/c": (200, 0, True),
         "a/b/c/new.flac": (200, 20, False),
     }
     seen = _watcher_snapshot_script(monkeypatch, [nested_before, nested_after])
@@ -3511,7 +3524,11 @@ async def test_filesystem_watcher_detects_nested_mutation(
     assert request.kind == "incremental"
     assert request.trigger == "automatic"
     assert request.policy_revision == resolver.policy_revision
-    assert [scope.scope_id for scope in request.scopes] == ["root-a"]
+    # The change sits in a/b/c, so the scan is scoped to that folder instead of
+    # the whole root (#620); the whole-root fallback has its own tests below.
+    assert [(scope.scope_id, scope.relative_path) for scope in request.scopes] == [
+        ("watch:root-a:a/b/c", "a/b/c")
+    ]
     wakeups.notify.assert_called_once_with("scan")
     assert sleeps == [300.0, 60.0, 300.0]
 
@@ -3711,6 +3728,658 @@ async def test_filesystem_watcher_logs_and_continues_on_iteration_error(
     )
     assert coordinator.request_run.await_count == 1
     assert sleeps == [300.0, 300.0, 60.0, 300.0]
+
+
+def _file(mtime: int = 100, size: int = 1) -> tuple[int, int, bool]:
+    return (mtime, size, False)
+
+
+def _directory(mtime: int = 100) -> tuple[int, int, bool]:
+    return (mtime, 0, True)
+
+
+def _tree(*files: str, mtime: int = 100) -> dict[str, tuple[int, int, bool]]:
+    """A snapshot holding ``files`` and every directory above them."""
+    snapshot: dict[str, tuple[int, int, bool]] = {}
+    for relative in files:
+        for parent in PurePath(relative).parents:
+            if str(parent) != ".":
+                snapshot[str(parent)] = _directory(mtime)
+        snapshot[relative] = _file(mtime)
+    return snapshot
+
+
+async def _run_watcher(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    resolver: object,
+    coordinator: AsyncMock,
+    wakeups: SimpleNamespace,
+    script: list[dict[str, tuple[int, int, bool]]],
+    *,
+    calls_before_cancel: int = 3,
+    clock_bump: float = 200.0,
+    root_paths_getter: Callable[[], dict[str, Path]] | None = None,
+) -> None:
+    """Drive the watcher through canned snapshots on a controllable clock."""
+    _watcher_snapshot_script(monkeypatch, script)
+    clock = [1000.0]
+    _watcher_sleep_breaker(
+        monkeypatch,
+        calls_before_cancel=calls_before_cancel,
+        clock_bump=clock_bump,
+        clock=clock,
+    )
+    await watch_library_filesystem(
+        lambda: coordinator,
+        root_paths_getter or (lambda: {"root-a": root}),
+        wakeups,
+        scheduler_getter=lambda: _quiet_scheduler(),
+        resolver_getter=lambda: resolver,
+        watcher_settings_getter=lambda: WatcherSettings(
+            enabled=True, poll_interval_seconds=300.0, batch_window_seconds=60.0
+        ),
+        clock_getter=lambda: clock[0],
+    )
+
+
+def _requested_scopes(coordinator: AsyncMock) -> list[tuple[str, str]]:
+    coordinator.request_run.assert_awaited_once()
+    request = coordinator.request_run.await_args.args[0]
+    return sorted((scope.scope_id, scope.relative_path) for scope in request.scopes)
+
+
+def _library_rules_resolver(
+    root: Path,
+    *,
+    root_policy: str = "automatic",
+    rules: list[LibraryPathPolicyRule] | None = None,
+) -> LibraryPolicyResolver:
+    default_rules = [
+        LibraryPathPolicyRule(id="skip", relative_path="Skip", policy="excluded"),
+        LibraryPathPolicyRule(
+            id="local", relative_path="Local", policy="local_metadata"
+        ),
+    ]
+    return LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(
+                    id="root-a",
+                    path=str(root),
+                    label="Library",
+                    policy=root_policy,
+                    rules=default_rules if rules is None else rules,
+                )
+            ]
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_scopes_new_album_to_its_own_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: a new album under an artist folder scans that album folder only."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    before = _tree("Artist/Old/01.flac")
+    after = {
+        **before,
+        **_tree("Artist/New/01.flac", "Artist/New/02.flac", mtime=200),
+        "Artist": _directory(200),
+    }
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [before, after])
+    assert _requested_scopes(coordinator) == [
+        ("watch:root-a:Artist/New", "Artist/New")
+    ]
+    request = coordinator.request_run.await_args.args[0]
+    scope = request.scopes[0]
+    assert scope.root_id == "root-a"
+    assert scope.root_path == str(root)
+    assert scope.effective_policy == "automatic"
+    assert scope.policy_revision == resolver.policy_revision
+    assert request.kind == "incremental"
+    assert request.trigger == "automatic"
+    wakeups.notify.assert_called_once_with("scan")
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_scopes_modified_file_to_its_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: a file rewritten in place (mtime/size moved) scans its folder."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    before = _tree("A/B/01.flac")
+    after = {**before, "A/B/01.flac": _file(150, 12)}
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [before, after])
+    assert _requested_scopes(coordinator) == [("watch:root-a:A/B", "A/B")]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_scopes_removed_album_to_nearest_existing_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: a removed album folder is covered by the nearest surviving folder."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    before = _tree("Artist/Gone/Disc 1/01.flac", "Artist/Kept/01.flac")
+    after = {**_tree("Artist/Kept/01.flac"), "Artist": _directory(200)}
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [before, after])
+    assert _requested_scopes(coordinator) == [("watch:root-a:Artist", "Artist")]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_replaces_a_folder_removed_after_it_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: a folder gone by request time would fail the run; use its ancestor."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    kept = _tree("Artist/Kept/01.flac")
+    added = {**kept, **_tree("Artist/Fresh/01.flac")}
+    await _run_watcher(
+        monkeypatch,
+        root,
+        resolver,
+        coordinator,
+        wakeups,
+        [kept, added, kept, kept],
+        calls_before_cancel=5,
+        clock_bump=20.0,
+    )
+    assert _requested_scopes(coordinator) == [("watch:root-a:Artist", "Artist")]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_ignores_directory_only_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: directory mtimes (and empty folders) alone never request a scan."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    before = _tree("Artist/01.flac")
+    after = {
+        **before,
+        "Artist": _directory(200),
+        "Artist/Empty": _directory(200),
+    }
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [before, after])
+    coordinator.request_run.assert_not_awaited()
+    wakeups.notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_ignores_files_the_scanner_never_indexes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: covers, logs, .DS_Store and management artifacts request nothing."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    before = _tree("Artist/Album/01.flac")
+    after = {
+        **before,
+        **_tree(
+            ".DS_Store",
+            "Artist/Album/cover.jpg",
+            "Artist/Album/rip.log",
+            ".recycle/Artist/Album/01.flac",
+            ".droppedneedle-management-x/02.flac",
+            mtime=200,
+        ),
+    }
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [before, after])
+    coordinator.request_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_treats_a_file_replaced_by_a_directory_as_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: a track path that becomes a directory is a removal in its folder."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    before = _tree("Artist/Album/01.flac")
+    after = {**before, "Artist/Album/01.flac": _directory(200)}
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [before, after])
+    assert _requested_scopes(coordinator) == [
+        ("watch:root-a:Artist/Album", "Artist/Album")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_collapses_nested_folders_and_keeps_separate_albums(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: nested folders collapse to the ancestor; siblings stay separate."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    after = _tree(
+        "A/One/01.flac",
+        "A/One/Disc 2/01.flac",
+        "A/Two/01.flac",
+        "B/Deep/Er/01.flac",
+    )
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [{}, after])
+    assert _requested_scopes(coordinator) == [
+        ("watch:root-a:A/One", "A/One"),
+        ("watch:root-a:A/Two", "A/Two"),
+        ("watch:root-a:B/Deep/Er", "B/Deep/Er"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_accumulates_folders_across_polls_in_one_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: folders seen in earlier polls of a window are not lost."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    first = _tree("X/A/01.flac")
+    second = {**first, **_tree("X/B/01.flac")}
+    third = {**second, **_tree("X/C/01.flac")}
+    await _run_watcher(
+        monkeypatch,
+        root,
+        resolver,
+        coordinator,
+        wakeups,
+        [{}, first, second, third, third],
+        calls_before_cancel=6,
+        clock_bump=20.0,
+    )
+    assert _requested_scopes(coordinator) == [
+        ("watch:root-a:X/A", "X/A"),
+        ("watch:root-a:X/B", "X/B"),
+        ("watch:root-a:X/C", "X/C"),
+    ]
+    wakeups.notify.assert_called_once_with("scan")
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_falls_back_to_whole_root_for_root_level_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: an audio file directly in the root scans the whole root, as before."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    after = _tree("loose.flac", "Album/01.flac")
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [{}, after])
+    assert _requested_scopes(coordinator) == [("root-a", ".")]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_falls_back_to_whole_root_past_the_folder_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: a bulk change (more folders than the cap) scans the whole root."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    after = _tree(*(f"A/Album {index}/01.flac" for index in range(MAX_SCOPED_FOLDERS + 1)))
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [{}, after])
+    assert _requested_scopes(coordinator) == [("root-a", ".")]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_keeps_scoping_at_exactly_the_folder_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: the cap is inclusive; exactly MAX_SCOPED_FOLDERS folders stay scoped."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    after = _tree(*(f"A/Album {index}/01.flac" for index in range(MAX_SCOPED_FOLDERS)))
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [{}, after])
+    request = coordinator.request_run.await_args.args[0]
+    assert len(request.scopes) == MAX_SCOPED_FOLDERS
+    assert all(scope.relative_path != "." for scope in request.scopes)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_falls_back_to_whole_root_when_scoping_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: an unexpected fault while scoping degrades to today's behaviour."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+
+    def _boom(_path: object) -> object:
+        raise RuntimeError("resolver fault")
+
+    monkeypatch.setattr(resolver, "resolve", _boom)
+    await _run_watcher(
+        monkeypatch, root, resolver, coordinator, wakeups, [{}, _tree("A/B/01.flac")]
+    )
+    assert _requested_scopes(coordinator) == [("root-a", ".")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("Artist/{name}/01.flac", [("watch:root-a:Artist", "Artist")]),
+        # With the non-NFC folder at the top level the nearest NFC ancestor
+        # is the root, so the whole root is scanned.
+        ("{name}/01.flac", [("root-a", ".")]),
+    ],
+)
+async def test_filesystem_watcher_falls_back_to_a_non_nfc_folders_nearest_nfc_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    template: str,
+    expected: list[tuple[str, str]],
+) -> None:
+    """#620: stored rows are NFC, so an NFD scope would never match their paths."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    nfd_album = unicodedata.normalize("NFD", "Caf\u00e9")
+    assert nfd_album != unicodedata.normalize("NFC", nfd_album)
+    after = _tree(template.format(name=nfd_album))
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [{}, after])
+    assert _requested_scopes(coordinator) == expected
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_skips_excluded_paths_and_applies_rule_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: excluded folders are not scanned; a rule's policy rides on the scope."""
+    _resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    resolver = _library_rules_resolver(root)
+    after = _tree(
+        "Skip/Album/01.flac",
+        "Local/Album/01.flac",
+        "Plain/Album/01.flac",
+        "Plain/Old/01.flac",
+    )
+    await _run_watcher(
+        monkeypatch,
+        root,
+        resolver,
+        coordinator,
+        wakeups,
+        [_tree("Plain/Old/01.flac", mtime=1), after],
+    )
+    request = coordinator.request_run.await_args.args[0]
+    assert sorted(
+        (scope.relative_path, scope.effective_policy) for scope in request.scopes
+    ) == [
+        ("Local/Album", "local_metadata"),
+        ("Plain/Album", "automatic"),
+        ("Plain/Old", "automatic"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_drops_pending_scan_when_every_change_is_excluded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: changes only under excluded paths request nothing."""
+    _resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    resolver = _library_rules_resolver(root)
+    await _run_watcher(
+        monkeypatch,
+        root,
+        resolver,
+        coordinator,
+        wakeups,
+        [{}, _tree("Skip/Album/01.flac")],
+    )
+    coordinator.request_run.assert_not_awaited()
+    wakeups.notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_keeps_included_rule_below_an_excluded_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: an excluded ancestor must not swallow an included descendant."""
+    _resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    resolver = _library_rules_resolver(
+        root,
+        root_policy="excluded",
+        rules=[
+            LibraryPathPolicyRule(
+                id="jazz", relative_path="Music/Jazz", policy="automatic"
+            ),
+            LibraryPathPolicyRule(
+                id="nested-skip", relative_path="Music/Jazz/Skip", policy="excluded"
+            ),
+            LibraryPathPolicyRule(
+                id="nested-back",
+                relative_path="Music/Jazz/Skip/Back",
+                policy="local_metadata",
+            ),
+        ],
+    )
+    after = _tree(
+        "Music/loose/01.flac",
+        "Music/Jazz/Miles/01.flac",
+        "Music/Jazz/Skip/Other/01.flac",
+        "Music/Jazz/Skip/Back/01.flac",
+        "Elsewhere/01.flac",
+    )
+    await _run_watcher(monkeypatch, root, resolver, coordinator, wakeups, [{}, after])
+    request = coordinator.request_run.await_args.args[0]
+    assert sorted(
+        (scope.relative_path, scope.effective_policy) for scope in request.scopes
+    ) == [
+        ("Music/Jazz/Miles", "automatic"),
+        ("Music/Jazz/Skip/Back", "local_metadata"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_keeps_pending_folders_and_skips_wakeup_on_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: a conflicted request retries next poll with the same folders."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    coordinator.request_run.side_effect = [
+        ScanRequestResult(
+            run_id="run-0",
+            disposition="conflict",
+            state="queued",
+            row_revision=1,
+            conflicting_kind="policy_reconcile",
+        ),
+        _started_result(),
+    ]
+    after = _tree("A/B/01.flac")
+    await _run_watcher(
+        monkeypatch,
+        root,
+        resolver,
+        coordinator,
+        wakeups,
+        [{}, after],
+        calls_before_cancel=5,
+    )
+    assert coordinator.request_run.await_count == 2
+    first, second = (call.args[0] for call in coordinator.request_run.await_args_list)
+    assert [scope.relative_path for scope in first.scopes] == ["A/B"]
+    assert [scope.relative_path for scope in second.scopes] == ["A/B"]
+    wakeups.notify.assert_called_once_with("scan")
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_forgets_pending_folders_of_a_repointed_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: a re-pointed root reseeds silently and drops its stale folders."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    moved = tmp_path / "moved"
+    paths = [root, root, moved, moved]
+    polls = {"count": 0}
+
+    def _root_paths() -> dict[str, Path]:
+        index = min(polls["count"], len(paths) - 1)
+        polls["count"] += 1
+        return {"root-a": paths[index]}
+
+    await _run_watcher(
+        monkeypatch,
+        root,
+        resolver,
+        coordinator,
+        wakeups,
+        [{}, _tree("A/B/01.flac"), _tree("C/D/01.flac")],
+        calls_before_cancel=7,
+        clock_bump=20.0,
+        root_paths_getter=_root_paths,
+    )
+    coordinator.request_run.assert_not_awaited()
+
+
+def test_changed_folders_covers_added_removed_and_modified_files() -> None:
+    previous = {
+        **_tree(
+            "A/old.flac",
+            "A/same.flac",
+            "A/edit.flac",
+            "Gone/Deep/x.flac",
+            "Tidy/y.flac",
+        ),
+        "A/edit.flac": _file(100, 5),
+    }
+    current = {
+        **_tree("A/same.flac", "A/edit.flac", "A/new.flac", "Tidy/y.flac"),
+        "A": _directory(999),
+        "A/edit.flac": _file(101, 5),
+        "Tidy/notes.txt": _file(),
+        "Tidy": _directory(999),
+    }
+    assert _changed_folders(previous, current) == {"A", "Gone/Deep"}
+
+
+def test_changed_folders_ignores_directory_entries() -> None:
+    previous = {"A": _directory(1), "A/B": _directory(1)}
+    current = {"A": _directory(2), "A/B": _directory(2), "A/C": _directory(2)}
+    assert _changed_folders(previous, current) == set()
+
+
+def test_changed_folders_counts_only_audio_files() -> None:
+    previous = _tree("A/01.flac", "A/cover.jpg")
+    current = {**previous, "A/cover.jpg": _file(200), "A/rip.log": _file()}
+    assert _changed_folders(previous, current) == set()
+    assert _changed_folders({}, {"A/02.FLAC": _file()}) == {"A"}
+
+
+def test_scannable_folder_walks_up_to_an_existing_nfc_directory() -> None:
+    snapshot = _tree("A/B/01.flac")
+    assert _scannable_folder("A/B", snapshot) == "A/B"
+    assert _scannable_folder("A/B/Disc 1", snapshot) == "A/B"
+    assert _scannable_folder("Gone/Deep", snapshot) == "."
+    assert _scannable_folder("A/B/01.flac", snapshot) == "A/B"
+
+
+def test_collapse_nested_keeps_the_ancestor_only() -> None:
+    assert _collapse_nested({"A", "A/B", "A/B/C", "AB", "D/E"}) == ["A", "AB", "D/E"]
+
+
+def test_scoped_scopes_returns_none_for_the_root_folder(tmp_path: Path) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _startup_resolver(root)
+    snapshot = _tree("A/01.flac")
+    assert _scoped_scopes("root-a", {".", "A"}, resolver, snapshot) is None
+    assert _scoped_scopes("root-a", {"Gone"}, resolver, snapshot) is None
+
+
+def test_scoped_scopes_skips_unknown_roots(tmp_path: Path) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _startup_resolver(root)
+    assert _scoped_scopes("unknown-root", {"A"}, resolver, _tree("A/01.flac")) == []
+
+
+async def _run_watcher_on_disk(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    resolver: object,
+    coordinator: AsyncMock,
+    wakeups: SimpleNamespace,
+    mutate: Callable[[], None],
+) -> None:
+    """Run the watcher on the real ``_snapshot_tree``; ``mutate`` runs after the seed poll."""
+    clock = [1000.0]
+    sleeps = {"count": 0}
+    real_sleep = asyncio.sleep
+
+    async def _fake_sleep(_delay: float) -> None:
+        sleeps["count"] += 1
+        clock[0] += 200.0
+        if sleeps["count"] == 1:
+            mutate()
+        if sleeps["count"] >= 3:
+            raise asyncio.CancelledError()
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    await watch_library_filesystem(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        wakeups,
+        scheduler_getter=lambda: _quiet_scheduler(),
+        resolver_getter=lambda: resolver,
+        watcher_settings_getter=lambda: WatcherSettings(
+            enabled=True, poll_interval_seconds=300.0, batch_window_seconds=60.0
+        ),
+        clock_getter=lambda: clock[0],
+    )
+
+
+def _write_library(root: Path, *files: str) -> None:
+    for relative in files:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"audio")
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_on_disk_album_rename_scans_the_artist_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: with the real snapshot, an album renamed inside an artist is scoped."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    _write_library(root, "Artist/Old/01.flac", "Artist/Other/01.flac", "Else/Album/01.flac")
+    await _run_watcher_on_disk(
+        monkeypatch,
+        root,
+        resolver,
+        coordinator,
+        wakeups,
+        lambda: (root / "Artist/Old").rename(root / "Artist/New"),
+    )
+    assert _requested_scopes(coordinator) == [("watch:root-a:Artist", "Artist")]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_on_disk_album_delete_scans_the_nearest_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: with the real snapshot, a deleted album folder maps to its artist."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    _write_library(
+        root, "Artist/Gone/Disc 1/01.flac", "Artist/Kept/01.flac", "Else/Album/01.flac"
+    )
+    await _run_watcher_on_disk(
+        monkeypatch,
+        root,
+        resolver,
+        coordinator,
+        wakeups,
+        lambda: shutil.rmtree(root / "Artist/Gone"),
+    )
+    assert _requested_scopes(coordinator) == [("watch:root-a:Artist", "Artist")]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_on_disk_new_album_scans_only_that_album(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#620: with the real snapshot, a new album plus a cover scans the album only."""
+    resolver, coordinator, _scheduler, wakeups, root = _watcher_harness(tmp_path)
+    _write_library(root, "Artist/Old/01.flac")
+    await _run_watcher_on_disk(
+        monkeypatch,
+        root,
+        resolver,
+        coordinator,
+        wakeups,
+        lambda: _write_library(
+            root, "Artist/New/01.flac", "Artist/New/cover.jpg", ".DS_Store"
+        ),
+    )
+    assert _requested_scopes(coordinator) == [
+        ("watch:root-a:Artist/New", "Artist/New")
+    ]
 
 
 def test_filesystem_snapshot_walks_nested_directories(
