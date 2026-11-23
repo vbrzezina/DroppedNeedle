@@ -1155,6 +1155,25 @@ class DownloadStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def get_latest_task_for_track(
+        self, recording_mbid: str, user_id: str
+    ) -> DownloadTask | None:
+        """The newest track task for this recording + user, whatever its status.
+        Lets the Wanted watcher see why the last attempt ended before it
+        re-dispatches the same recording."""
+
+        def operation(conn: sqlite3.Connection) -> DownloadTask | None:
+            row = conn.execute(
+                """SELECT * FROM download_tasks
+                   WHERE recording_mbid = ? AND user_id = ?
+                     AND download_type = 'track'
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (recording_mbid, user_id),
+            ).fetchone()
+            return _row_to_task(row)
+
+        return await self._read(operation)
+
     async def list_tasks(
         self,
         user_id: str | None = None,

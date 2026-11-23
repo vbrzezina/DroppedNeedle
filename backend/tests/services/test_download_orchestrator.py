@@ -5090,6 +5090,75 @@ async def test_track_collision_fails_with_occupied_message(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_track_collision_does_not_fail_over_to_other_peers(tmp_path: Path):
+    """Every peer delivers the same recording into the same occupied path, so a
+    track collision stops after the first download instead of pulling (and
+    preserving) one more full copy per candidate (#675)."""
+    client = _FailoverClient(
+        {"peer1": "complete", "peer2": "complete", "peer3": "complete"}
+    )
+    store, orch, fp, _lib = _build(
+        tmp_path,
+        client=client,
+        max_failover=3,
+        fp_result=ProcessResult(
+            succeeded=[],
+            failed=[FileFailure(filename="peer1/01.flac", reason=TARGET_OCCUPIED)],
+        ),
+        imported_rows=[],
+    )
+    orch._strategies["soulseek"]._track_matcher.rank = AsyncMock(
+        return_value=[
+            _candidate(0.9, username="peer1"),
+            _candidate(0.85, username="peer2"),
+            _candidate(0.8, username="peer3"),
+        ]
+    )
+    task = await _new_task(
+        store,
+        download_type="track",
+        recording_mbid="rec-1",
+        track_title="Song",
+        track_count=1,
+    )
+
+    await orch.process_task(task.id)
+
+    final = await store.get_task(task.id)
+    assert final.status == "failed"
+    assert final.error_message == _TARGET_OCCUPIED_MSG
+    assert fp.process_downloaded.await_count == 1
+    assert len(await store.list_download_attempts(task.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_collision_failure_is_never_auto_retried(tmp_path: Path):
+    """A library-path collision fails the same way on every retry, so auto-retry
+    leaves it for the user instead of re-downloading it on the backoff ladder."""
+    store, orch, *_ = _build(tmp_path, auto_retry_base_interval_minutes=0.01)
+    orch.dispatch = MagicMock()
+    task = await _new_task(
+        store,
+        download_type="track",
+        recording_mbid="rec-1",
+        track_title="Song",
+        status="failed",
+        retry_count=0,
+    )
+    await store.update_status(
+        task.id,
+        "failed",
+        completed_at=_t.time() - 999_999,
+        error_message=_TARGET_OCCUPIED_MSG,
+    )
+
+    await orch.retry_failed_tasks()
+
+    orch.dispatch.assert_not_called()
+    assert orch.next_retry_at(await store.get_task(task.id)) is None
+
+
+@pytest.mark.asyncio
 async def test_album_all_collision_is_not_complete_via_delivery_trust(
     tmp_path: Path,
 ):

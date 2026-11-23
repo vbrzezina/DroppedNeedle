@@ -134,6 +134,7 @@ def env(tmp_path) -> _Env:
     download_store.get_active_task_for_album_any_user.return_value = None
     download_store.has_unresolved_held_for_task.return_value = False
     download_store.get_task.return_value = None
+    download_store.get_latest_task_for_track.return_value = None
 
     # F-PERF-03: the service reads linked tasks through the BATCH method.
     # Default the batch map to whatever the per-test ``get_task`` mock is
@@ -689,6 +690,68 @@ async def test_partial_want_dispatches_missing_tracks_capped_with_logged_drop(
     assert any(r.message == "wanted.track_dispatch_capped" for r in caplog.records)
     # per-track dispatches must NOT hijack the album request's task link (§4.8)
     env.requests.async_update_download_task_id.assert_not_awaited()
+
+
+def _collided_latest(blocked: set[str]):
+    async def latest(recording_mbid, user_id):
+        if recording_mbid in blocked:
+            return _task(error=_TARGET_OCCUPIED_MSG, task_id=f"t-{recording_mbid}")
+        return None
+
+    return latest
+
+
+@pytest.mark.asyncio
+async def test_partial_want_skips_tracks_whose_last_task_collided(env, caplog):
+    """A missing track whose newest task failed on a library-path collision is not
+    re-dispatched: the new download would land in the same occupied path (#675)."""
+    await _add_watch(env, kind="partial")
+    env.album_service.get_album_tracks_info.side_effect = None
+    env.album_service.get_album_tracks_info.return_value = SimpleNamespace(
+        tracks=[
+            _track("rec-1", "One", 1),
+            _track("rec-2", "Two", 2),
+            _track("rec-3", "Three", 3),
+        ]
+    )
+    env.library.get_file_rows_for_album.return_value = [_row("rec-1")]
+    env.download_store.get_latest_task_for_track.side_effect = _collided_latest(
+        {"rec-2"}
+    )
+    env.ds.scout_album.return_value = [_cand(tier="auto")]
+
+    with caplog.at_level("INFO"):
+        await env.watcher.run_sweep()
+
+    requested = [
+        c.kwargs["recording_mbid"] for c in env.ds.request_track.await_args_list
+    ]
+    assert requested == ["rec-3"]
+    assert any(r.message == "wanted.track_dispatch_skipped" for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_partial_want_with_only_collided_tracks_neither_scouts_nor_dispatches(
+    env,
+):
+    await _add_watch(env, kind="partial")
+    env.album_service.get_album_tracks_info.side_effect = None
+    env.album_service.get_album_tracks_info.return_value = SimpleNamespace(
+        tracks=[_track("rec-1", "One", 1), _track("rec-2", "Two", 2)]
+    )
+    env.library.get_file_rows_for_album.return_value = [_row("rec-1")]
+    env.download_store.get_latest_task_for_track.side_effect = _collided_latest(
+        {"rec-2"}
+    )
+    env.ds.scout_album.return_value = [_cand(tier="auto")]
+
+    await env.watcher.run_sweep()
+
+    env.ds.scout_album.assert_not_awaited()
+    env.ds.request_track.assert_not_awaited()
+    watch = await env.store.get_watch("rg-1")
+    assert watch.state == "watching"
+    assert watch.next_check_at > time.time()
 
 
 @pytest.mark.asyncio

@@ -212,6 +212,16 @@ _TARGET_OCCUPIED_MSG = (
     "Files downloaded, but the library path is occupied by a file this release "
     "does not own - held for review instead of overwriting it"
 )
+
+
+def _retry_cannot_help(task) -> bool:  # noqa: ANN001 - DownloadTask
+    """True when the task failed for a reason a fresh download cannot change: the
+    library path is occupied by bytes this release does not own. Auto-retry and the
+    Wanted watcher must not re-dispatch it - each attempt re-downloads the file into
+    the same collision (#675)."""
+    return (task.error_message or "") == _TARGET_OCCUPIED_MSG
+
+
 _MANAGEMENT_HELD_MSG = "Download complete. The files are secured while Library Management waits for attention."
 _MANAGEMENT_HOLD_STORAGE_MSG = (
     "Download complete, but DroppedNeedle could not secure its Library Management "
@@ -1883,6 +1893,31 @@ class DownloadOrchestrator:
                 if is_complete:
                     await self._finalize(
                         task, DownloadStatus.COMPLETED, process_result=result
+                    )
+                    return
+
+                # A single track that collided with local library bytes: every other
+                # peer would deliver the same recording into the same occupied path,
+                # so failing over only downloads (and preserves) another full copy per
+                # candidate. Stop here like the other local faults; the collision is
+                # the user's to resolve (held for review), not another peer's.
+                if (
+                    task.download_type == "track"
+                    and not imported_any
+                    and any(f.reason == TARGET_OCCUPIED for f in result.failed)
+                ):
+                    logger.info(
+                        "download.failover_stopped",
+                        extra={"task_id": task.id, "reason": TARGET_OCCUPIED},
+                    )
+                    await self._settle_incomplete(
+                        task,
+                        imported_any,
+                        source_missing=source_missing,
+                        import_failed=import_failed,
+                        target_occupied=True,
+                        tag_mismatch=tag_mismatch,
+                        process_result=attempt_result,
                     )
                     return
 
@@ -3783,6 +3818,7 @@ class DownloadOrchestrator:
             not self._auto_retry_enabled
             or task.status not in (DownloadStatus.FAILED, DownloadStatus.PARTIAL)
             or task.retry_count >= self._auto_retry_max_attempts
+            or _retry_cannot_help(task)
         ):
             return None
         anchor = task.completed_at or task.created_at
@@ -3807,6 +3843,13 @@ class DownloadOrchestrator:
             backoff = self._retry_backoff_seconds(task.retry_count)
             completed_at = task.completed_at or task.created_at or 0.0
             if now - completed_at < backoff:
+                continue
+
+            # A library-path collision is local: the next download lands on the same
+            # occupied path and fails the same way, leaving one more full copy in the
+            # downloads folder each time. Only the user can resolve it (import the held
+            # copy, or move/remove the occupying file and retry by hand).
+            if _retry_cannot_help(task):
                 continue
 
             # Paused for review: this task left a track held ("couldn't verify"). Re-downloading
