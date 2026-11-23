@@ -1561,3 +1561,30 @@ async def test_folder_exclusion_round_trips_and_clears_by_album(store):
     # A manual re-request clears album rows (covering folder rows too).
     assert await store.delete_quarantine_for_album("RG-1") == 1
     assert ("soulseek", identity) not in await store.load_quarantine_set()
+
+
+@pytest.mark.asyncio
+async def test_get_latest_task_for_track_returns_newest_any_status(store):
+    def _kwargs(**extra):
+        return dict(
+            user_id="user-a",
+            download_type="track",
+            release_group_mbid="rg-1",
+            recording_mbid="rec-1",
+            artist_name="Artist",
+            album_title="Album",
+            track_title="Song",
+            **extra,
+        )
+
+    first = await store.create_task(**_kwargs())
+    await store.update_status(first.id, "failed", error_message="first")
+    second = await store.create_task(**_kwargs())
+    await store.update_status(second.id, "failed", error_message="second")
+    await store.create_task(**{**_kwargs(), "user_id": "user-b"})
+
+    latest = await store.get_latest_task_for_track("rec-1", "user-a")
+    assert latest is not None
+    assert latest.id == second.id
+    assert latest.error_message == "second"
+    assert await store.get_latest_task_for_track("rec-other", "user-a") is None

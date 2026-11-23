@@ -43,6 +43,7 @@ from services.native.download_orchestrator import (
     _NO_MATCH_MSG,
     _NO_SOURCE_MSG,
     _TAG_MISMATCH_MSG,
+    _retry_cannot_help,
 )
 from services.native.download_service import ALREADY_IN_LIBRARY
 
@@ -730,6 +731,21 @@ class WantedWatcherService:
                 await self._fulfil(want)
                 return "satisfied"
             missing_tracks = uncovered_tracks(rows, tracks)
+            if want.kind == "partial" and missing_tracks:
+                still_missing = await self._drop_collided_tracks(want, missing_tracks)
+                if not still_missing:
+                    # Every missing track last failed on a library-path collision:
+                    # a re-download lands in the same occupied path, so neither
+                    # scout nor dispatch until the user resolves it (#675).
+                    await self._store.reschedule(
+                        mbid,
+                        now
+                        + self._interval_seconds(
+                            want.first_release_date, want.quiet_streak, now
+                        ),
+                    )
+                    return "skipped"
+                missing_tracks = still_missing
         elif want.kind == "missing":
             # tracklist unavailable: the library-presence semantic the requests
             # page uses (§5.2.3.a) - never raw file-row counts
@@ -1009,6 +1025,38 @@ class WantedWatcherService:
             extra={"release_group_mbid": mbid, "kind": "partial", "tracks": dispatched},
         )
         await self._publish(want, "wanted_auto_dispatched", {"tracks": dispatched})
+
+    async def _drop_collided_tracks(
+        self, want: WantedWatch, missing_tracks: list
+    ) -> list:
+        """Drop the missing tracks whose newest track task failed because the
+        library path is occupied by a file this release does not own. Re-dispatching
+        them only re-downloads the same recording into the same collision - each
+        cycle leaving another full copy in the downloads folder - so they wait for
+        the user (import the held copy, or clear the path and retry by hand).
+        Fail-open: a lookup error keeps the track."""
+        kept: list = []
+        for track in missing_tracks:
+            if track.recording_id:
+                try:
+                    latest = await self._download_store.get_latest_task_for_track(
+                        track.recording_id, want.user_id
+                    )
+                except Exception:  # noqa: BLE001 - keep the track on lookup trouble
+                    latest = None
+                if latest is not None and _retry_cannot_help(latest):
+                    logger.info(
+                        "wanted.track_dispatch_skipped",
+                        extra={
+                            "release_group_mbid": want.release_group_mbid,
+                            "recording_mbid": track.recording_id,
+                            "task_id": latest.id,
+                            "reason": "target_occupied",
+                        },
+                    )
+                    continue
+            kept.append(track)
+        return kept
 
     # -- collaborator wrappers (all fail-open: the gates downstream stay armed) --
 
